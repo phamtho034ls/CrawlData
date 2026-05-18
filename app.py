@@ -1,8 +1,11 @@
-"""Streamlit dashboard — polished sidebar, list views for video & text+link."""
+"""Streamlit dashboard — sidebar nav, pipeline progress, multi-keyword collect."""
 
 from __future__ import annotations
 
+import threading
+import time
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 import streamlit as st
@@ -14,6 +17,8 @@ configure_prefect()
 from main_pipeline import run_pipeline
 from src.device_utils import gpu_status_message
 from src.pipeline_logging import LOG_FILE, setup_logging
+from src.pipeline_progress import PipelineProgress
+from src.scraper_config import ScraperConfig
 from src.trend_reader import DATA_TRENDS_DIR, list_all_trends, load_trend_summary
 
 setup_logging()
@@ -30,34 +35,19 @@ APP_CSS = """
     @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&display=swap');
     html, body, [class*="css"] { font-family: 'DM Sans', sans-serif; }
     .block-container { padding-top: 1.25rem; max-width: 1200px; }
-    [data-testid="stSidebar"] {
-        min-width: 300px !important;
-        max-width: 300px !important;
+    section[data-testid="stSidebar"] > div {
         background: linear-gradient(165deg, #0f172a 0%, #1e293b 55%, #0f172a 100%);
-        border-right: 1px solid #334155;
     }
-    [data-testid="stSidebar"] .stMarkdown,
-    [data-testid="stSidebar"] label,
-    [data-testid="stSidebar"] p,
-    [data-testid="stSidebar"] span { color: #e2e8f0 !important; }
-    [data-testid="stSidebar"] hr { border-color: #334155; }
+    section[data-testid="stSidebar"] .stMarkdown,
+    section[data-testid="stSidebar"] label,
+    section[data-testid="stSidebar"] p,
+    section[data-testid="stSidebar"] span { color: #e2e8f0 !important; }
+    section[data-testid="stSidebar"] hr { border-color: #334155; }
     .sidebar-brand {
         font-size: 1.45rem; font-weight: 700; color: #f8fafc !important;
         letter-spacing: -0.02em; margin-bottom: 0.15rem;
     }
     .sidebar-tagline { color: #94a3b8 !important; font-size: 0.82rem; }
-    .nav-hint { color: #64748b !important; font-size: 0.75rem; margin-top: -0.4rem; }
-    .item-card {
-        background: #1e293b;
-        border: 1px solid #334155;
-        border-radius: 12px;
-        padding: 1rem 1.1rem;
-        margin-bottom: 0.65rem;
-    }
-    .item-card .card-title { color: #f1f5f9; font-weight: 600; font-size: 0.95rem; }
-    .item-card .card-meta { color: #94a3b8; font-size: 0.78rem; margin: 0.25rem 0 0.5rem 0; }
-    .item-card .card-text { color: #cbd5e1; font-size: 0.88rem; line-height: 1.55; }
-    .item-card a { color: #38bdf8 !important; }
     div[data-testid="stMetric"] {
         background: #1e293b; border: 1px solid #334155; border-radius: 10px;
     }
@@ -67,10 +57,10 @@ APP_CSS = """
 """
 st.markdown(APP_CSS, unsafe_allow_html=True)
 
-PAGES = {
-    "storage": ("📚", "Kho lưu trữ", "Xem trend & video đã lưu"),
-    "collect": ("➕", "Thu thập mới", "Chạy pipeline từ khóa"),
-    "logs": ("📋", "Nhật ký", "Log hệ thống"),
+PAGE_LABELS = {
+    "storage": "📚 Kho lưu trữ",
+    "collect": "➕ Thu thập mới",
+    "logs": "📋 Nhật ký",
 }
 
 if "page" not in st.session_state:
@@ -81,6 +71,8 @@ if "last_result" not in st.session_state:
     st.session_state.last_result = None
 if "last_error" not in st.session_state:
     st.session_state.last_error = None
+if "pipeline_job" not in st.session_state:
+    st.session_state.pipeline_job = None
 
 
 def _read_logs(tail_lines: int = 120) -> str:
@@ -91,12 +83,116 @@ def _read_logs(tail_lines: int = 120) -> str:
     )
 
 
-def _type_label(item_type: str) -> str:
-    return {
-        "summary": "📝 Tóm tắt",
-        "reference": "🔗 Tham khảo",
-        "transcript": "🎙️ Transcript",
-    }.get(item_type, "📄 Nội dung")
+def _format_duration(seconds: float | None) -> str:
+    if seconds is None:
+        return "—"
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    return f"{seconds / 60:.1f} phút"
+
+
+def _format_clock(seconds: float) -> str:
+    total = int(max(0, seconds))
+    h, rem = divmod(total, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h:02d}:{m:02d}:{s:02d}"
+    return f"{m:02d}:{s:02d}"
+
+
+_KEYWORD_ICONS = {
+    "pending": "⏳ Chờ",
+    "searching": "🔍 Đang tìm",
+    "done": "✅ Xong",
+    "error": "⚠️ Lỗi",
+}
+
+
+def _render_keyword_list(data: dict[str, Any], placeholder) -> None:
+    keywords = data.get("expanded_keywords") or []
+    if not keywords:
+        placeholder.empty()
+        return
+
+    states: dict[str, str] = data.get("keyword_states") or {}
+    counts: dict[str, int] = data.get("keyword_video_counts") or {}
+    current = data.get("current_keyword")
+    done = data.get("keywords_done", 0)
+    total = data.get("keywords_total", len(keywords))
+
+    lines = [f"**Từ khóa mở rộng ({done}/{total})**"]
+    for kw in keywords:
+        status = states.get(kw, "pending")
+        label = _KEYWORD_ICONS.get(status, "•")
+        line = f"- {label} · `{kw}`"
+        if status == "done" and kw in counts:
+            line += f" — **{counts[kw]}** video"
+        if status == "searching" or kw == current:
+            line += " **← đang chạy**"
+        lines.append(line)
+    placeholder.markdown("\n".join(lines))
+
+
+def _run_pipeline_worker(job: dict[str, Any]) -> None:
+    """Background worker — only mutates job dict (no Streamlit calls)."""
+
+    def on_progress(data: dict[str, Any]) -> None:
+        job["progress_data"] = data
+        message = data.get("message")
+        if message:
+            job["log"].append(message)
+
+    try:
+        result = run_pipeline(
+            keyword=job["keyword"],
+            mode=job["mode"],
+            scraper_config=job["scraper_config"],
+            progress=PipelineProgress(on_update=on_progress),
+        )
+        job["result"] = result
+        job["error"] = None
+    except Exception as exc:
+        job["result"] = None
+        job["error"] = str(exc)
+    finally:
+        job["running"] = False
+        job["finished_at"] = time.time()
+
+
+def _paint_progress_ui(
+    data: dict[str, Any],
+    *,
+    elapsed_seconds: float,
+    widgets: dict[str, Any],
+) -> None:
+    progress_bar = widgets["progress_bar"]
+    status_box = widgets["status_box"]
+    clock_display = widgets["clock_display"]
+    elapsed_metric = widgets["elapsed_metric"]
+    eta_metric = widgets["eta_metric"]
+    step_metric = widgets["step_metric"]
+    keyword_list_placeholder = widgets["keyword_list_placeholder"]
+    log_box = widgets["log_box"]
+    log_lines: list[str] = widgets.get("log_lines") or []
+
+    progress_bar.progress(
+        data.get("fraction", 0.0),
+        text=data.get("message", "Đang chạy…"),
+    )
+    status_box.info(data.get("message", "Đang chạy…"))
+    clock_display.markdown(
+        f"### ⏱ {_format_clock(elapsed_seconds)}",
+        help="Thời gian chạy thực",
+    )
+    elapsed_metric.metric("Đã chạy", _format_duration(elapsed_seconds))
+    eta_metric.metric("Ước tính còn", _format_duration(data.get("eta_seconds")))
+    step_metric.metric(
+        "Bước",
+        f"{data.get('current_step', 0)}/{data.get('total_steps', '?')}",
+    )
+    _render_keyword_list(data, keyword_list_placeholder)
+    if log_lines:
+        log_box.code("\n".join(log_lines[-10:]), language="text")
 
 
 def _render_item_cards(
@@ -113,24 +209,12 @@ def _render_item_cards(
         title = item.get("title") or f"Mục {index}"
         text = (item.get("text") or "").strip()
         url = (item.get("url") or "").strip()
-        meta = _type_label(item.get("type") or "")
 
         with st.container(border=True):
-            head_l, head_r = st.columns([5, 1])
-            with head_l:
-                st.markdown(f"**#{index} · {title}**")
-                st.caption(meta)
-            with head_r:
-                if url:
-                    st.link_button(
-                        link_label,
-                        url,
-                        key=f"txt_link_{index}_{hash(url) % 10**6}",
-                    )
-            display_text = text[:1500] + ("..." if len(text) > 1500 else "")
-            st.write(display_text)
+            st.markdown(f"**#{index} · {title}**")
+            st.write(text[:1500] + ("..." if len(text) > 1500 else ""))
             if url:
-                st.markdown(f"[{url}]({url})")
+                st.link_button(link_label, url, key=f"txt_{index}_{hash(url) % 10**6}")
 
 
 def _render_video_cards(videos: list[dict]) -> None:
@@ -142,11 +226,14 @@ def _render_video_cards(videos: list[dict]) -> None:
     for index, video in enumerate(videos, start=1):
         views = video.get("view_count")
         platform = video.get("platform") or "?"
+        fmt = video.get("video_format") or "—"
         rows.append(
             {
                 "#": index,
                 "Tiêu đề": video.get("title") or "—",
                 "Nền tảng": platform.upper(),
+                "Định dạng": fmt,
+                "Từ khóa": video.get("source_keyword") or "—",
                 "Lượt xem": f"{views:,}" if isinstance(views, int) else "—",
                 "Link": video.get("url") or "",
             }
@@ -184,75 +271,56 @@ def _render_trend_detail(trend: dict) -> None:
     with tab_text:
         _render_item_cards(
             trend.get("text_items") or [],
-            empty_message="Chưa có nội dung dạng danh sách. Chạy lại pipeline để tạo `trend_content.json`.",
+            empty_message="Chưa có nội dung. Chạy lại pipeline.",
             link_label="Mở nguồn",
         )
 
 
-# ——————————————————————————————————————————————
-# Sidebar
-# ——————————————————————————————————————————————
+# ——— Sidebar (radio nav — không chặn nút thu gọn) ———
 with st.sidebar:
     st.markdown('<p class="sidebar-brand">DataCrawl</p>', unsafe_allow_html=True)
     st.markdown(
-        '<p class="sidebar-tagline">Trend pipeline · link + text</p>',
+        '<p class="sidebar-tagline">Multi-keyword · YT + TikTok</p>',
         unsafe_allow_html=True,
     )
     st.divider()
 
-    for key, (icon, label, hint) in PAGES.items():
-        if st.button(
-            f"{icon}  {label}",
-            key=f"nav_{key}",
-            use_container_width=True,
-            type="primary" if st.session_state.page == key else "secondary",
-        ):
-            st.session_state.page = key
-
-    st.markdown(
-        f'<p class="nav-hint">{PAGES[st.session_state.page][2]}</p>',
-        unsafe_allow_html=True,
+    page_keys = list(PAGE_LABELS.keys())
+    selected = st.radio(
+        "Điều hướng",
+        page_keys,
+        format_func=lambda k: PAGE_LABELS[k],
+        index=page_keys.index(st.session_state.page),
+        label_visibility="collapsed",
     )
+    st.session_state.page = selected
 
     trends = list_all_trends()
 
-    if st.session_state.page == "storage":
+    if st.session_state.page == "storage" and trends:
         st.divider()
         st.markdown("**Chọn trend**")
-        if trends:
-            options = {t["id"]: t["label"] for t in trends}
-            ids = list(options.keys())
-            if st.session_state.selected_trend_id not in ids:
-                st.session_state.selected_trend_id = ids[0]
-            st.session_state.selected_trend_id = st.selectbox(
-                "Trend",
-                options=ids,
-                format_func=lambda x: f"{options[x]} ({next(t['video_count'] for t in trends if t['id']==x)} video)",
-                label_visibility="collapsed",
-            )
-            st.caption(f"{len(trends)} trend trong kho")
-        else:
-            st.caption("Chưa có trend nào.")
-
-    if st.session_state.page == "collect":
-        st.divider()
-        st.markdown("**Gợi ý**")
-        st.caption("Dùng chế độ Link + text để lưu nhanh, không tải file video.")
+        options = {t["id"]: t["label"] for t in trends}
+        ids = list(options.keys())
+        if st.session_state.selected_trend_id not in ids:
+            st.session_state.selected_trend_id = ids[0]
+        st.session_state.selected_trend_id = st.selectbox(
+            "Trend",
+            options=ids,
+            format_func=lambda x: f"{options[x]} ({next(t['video_count'] for t in trends if t['id']==x)} video)",
+            label_visibility="collapsed",
+        )
 
     st.divider()
-    st.caption(gpu_status_message()[:80] + "…" if len(gpu_status_message()) > 80 else gpu_status_message())
+    st.caption(gpu_status_message())
 
-# ——————————————————————————————————————————————
-# Pages
-# ——————————————————————————————————————————————
 page = st.session_state.page
 
 if page == "storage":
     st.markdown("## Kho lưu trữ trend")
-    st.caption("Danh sách trend ở sidebar · video và text+link hiển thị dạng bảng / thẻ.")
 
     if not trends:
-        st.info("Chưa có dữ liệu. Vào **Thu thập mới** (sidebar) để chạy pipeline.")
+        st.info("Chưa có dữ liệu. Vào **Thu thập mới** để chạy pipeline.")
     elif st.session_state.selected_trend_id:
         trend = next(
             (t for t in trends if t["id"] == st.session_state.selected_trend_id),
@@ -260,60 +328,163 @@ if page == "storage":
         )
         _render_trend_detail(trend)
 
-        with st.expander("Bảng tổng quan tất cả trend"):
-            st.dataframe(
-                pd.DataFrame(
-                    [
-                        {
-                            "Trend": t["label"],
-                            "Video": t["video_count"],
-                            "Text": t.get("text_item_count", 0),
-                            "Cập nhật": t.get("updated_at", "—"),
-                        }
-                        for t in trends
-                    ]
-                ),
-                use_container_width=True,
-                hide_index=True,
-            )
-
 elif page == "collect":
     st.markdown("## Thu thập trend mới")
 
-    keyword = st.text_input("Từ khóa trend", value="AI tools")
-    col_a, col_b = st.columns(2)
-    with col_a:
-        video_limit = st.slider("Số video tối đa", 3, 15, 8)
-    with col_b:
+    keyword = st.text_input("Chủ đề / từ khóa gốc", value="AI agent")
+
+    st.markdown("#### Cấu hình thu thập")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        keyword_count = st.number_input("Số từ khóa (LLM)", 3, 20, 10)
+        top_per_kw = st.number_input("Top video / từ khóa", 3, 20, 10)
+    with c2:
+        pool_per_kw = st.number_input("Pool tìm kiếm / từ khóa", 10, 50, 20)
+        min_views = st.number_input("Lượt xem tối thiểu", 10_000, 1_000_000, 50_000, step=10_000)
+    with c3:
+        recency_days = st.selectbox("Trong vòng", [7], format_func=lambda d: f"{d} ngày")
         pipeline_mode = st.selectbox(
             "Chế độ lưu",
             ["links", "full"],
-            format_func=lambda x: "🔗 Link + text (khuyến nghị)" if x == "links" else "📥 Full + Whisper",
+            format_func=lambda x: "🔗 Link + text" if x == "links" else "📥 Full + Whisper",
         )
+
+    st.caption(
+        f"Mỗi chủ đề → **{keyword_count}** từ khóa (LLM) · mỗi từ khóa lấy tối đa "
+        f"**{pool_per_kw}** video (YT Shorts, YT dài, TikTok) · giữ **{top_per_kw}** "
+        f"video view cao nhất · ≥ **{min_views:,}** views · **{recency_days}** ngày."
+    )
+
+    st.markdown("#### Tiến trình pipeline")
+    progress_bar = st.progress(0.0, text="Sẵn sàng")
+    status_box = st.empty()
+
+    timer_col, metrics_col = st.columns([1, 2])
+    with timer_col:
+        clock_display = st.empty()
+    with metrics_col:
+        m1, m2, m3 = st.columns(3)
+        elapsed_metric = m1.empty()
+        eta_metric = m2.empty()
+        step_metric = m3.empty()
+
+    kw_col, log_col = st.columns([1, 1])
+    with kw_col:
+        with st.container(border=True):
+            keyword_list_placeholder = st.empty()
+    with log_col:
+        log_box = st.empty()
+
+    ui_widgets = {
+        "progress_bar": progress_bar,
+        "status_box": status_box,
+        "clock_display": clock_display,
+        "elapsed_metric": elapsed_metric,
+        "eta_metric": eta_metric,
+        "step_metric": step_metric,
+        "keyword_list_placeholder": keyword_list_placeholder,
+        "log_box": log_box,
+    }
 
     if st.session_state.last_error:
         st.error(st.session_state.last_error)
 
-    if st.button("▶ Bắt đầu pipeline", type="primary", use_container_width=True):
+    job = st.session_state.pipeline_job
+
+    if job and job.get("running"):
+        elapsed = time.time() - job["started_at"]
+        data = job.get("progress_data") or {
+            "fraction": 0.0,
+            "message": "Đang khởi động pipeline…",
+            "current_step": 0,
+            "total_steps": "?",
+        }
+        ui_widgets["log_lines"] = job.get("log") or []
+        _paint_progress_ui(data, elapsed_seconds=elapsed, widgets=ui_widgets)
+        time.sleep(0.4)
+        st.rerun()
+
+    if job and not job.get("running") and not job.get("handled"):
+        job["handled"] = True
+        elapsed = job.get("finished_at", time.time()) - job["started_at"]
+        data = job.get("progress_data") or {}
+
+        if job.get("error"):
+            st.session_state.last_error = job["error"]
+            progress_bar.progress(data.get("fraction", 0.0), text="Lỗi")
+            status_box.error(job["error"])
+            clock_display.markdown(f"### ⏱ {_format_clock(elapsed)} (dừng)")
+            ui_widgets["log_lines"] = job.get("log") or []
+            _paint_progress_ui(data, elapsed_seconds=elapsed, widgets=ui_widgets)
+            st.session_state.pipeline_job = None
+        else:
+            result = job["result"]
+            progress_bar.progress(1.0, text="Hoàn tất")
+            clock_display.markdown(f"### ⏱ {_format_clock(elapsed)} (xong)")
+            status_box.success(
+                f"Hoàn tất sau **{_format_clock(elapsed)}** · "
+                f"**{len(result.get('scraped_videos', []))}** video · "
+                f"**{len(result.get('expanded_keywords', []))}** từ khóa"
+            )
+            final_data = {
+                "expanded_keywords": result.get("expanded_keywords") or [],
+                "keyword_states": {
+                    k: "done" for k in (result.get("expanded_keywords") or [])
+                },
+                "keyword_video_counts": {},
+                "keywords_done": len(result.get("expanded_keywords") or []),
+                "keywords_total": len(result.get("expanded_keywords") or []),
+                "fraction": 1.0,
+                "message": "Hoàn tất",
+            }
+            _render_keyword_list(final_data, keyword_list_placeholder)
+            st.session_state.last_result = result
+            st.session_state.selected_trend_id = Path(result["trend_root"]).name
+            st.session_state.pipeline_job = None
+            st.session_state.page = "storage"
+        st.rerun()
+
+    pipeline_busy = bool(job and job.get("running"))
+    if st.button(
+        "▶ Bắt đầu pipeline",
+        type="primary",
+        use_container_width=True,
+        disabled=pipeline_busy,
+    ):
         if not keyword.strip():
-            st.error("Vui lòng nhập từ khóa.")
+            st.error("Vui lòng nhập chủ đề.")
         else:
             st.session_state.last_error = None
-            with st.spinner("Đang thu thập…"):
-                try:
-                    result = run_pipeline(
-                        keyword=keyword.strip(),
-                        video_limit=video_limit,
-                        mode=pipeline_mode,
-                    )
-                    st.session_state.last_result = result
-                    st.session_state.selected_trend_id = Path(result["trend_root"]).name
-                    st.session_state.page = "storage"
-                    st.success("Hoàn tất! Chuyển sang **Kho lưu trữ**.")
-                    st.rerun()
-                except Exception as exc:
-                    st.session_state.last_error = str(exc)
-                    st.error(str(exc))
+            scraper_config = ScraperConfig(
+                recency_days=recency_days,
+                min_views=int(min_views),
+                keyword_count=int(keyword_count),
+                videos_per_keyword_search=int(pool_per_kw),
+                top_videos_per_keyword=int(top_per_kw),
+            )
+            st.session_state.pipeline_job = {
+                "running": True,
+                "handled": False,
+                "started_at": time.time(),
+                "keyword": keyword.strip(),
+                "mode": pipeline_mode,
+                "scraper_config": scraper_config,
+                "progress_data": {
+                    "fraction": 0.0,
+                    "message": "Đang khởi động pipeline…",
+                    "current_step": 0,
+                    "total_steps": 3 + int(keyword_count),
+                },
+                "log": [],
+                "result": None,
+                "error": None,
+            }
+            threading.Thread(
+                target=_run_pipeline_worker,
+                args=(st.session_state.pipeline_job,),
+                daemon=True,
+            ).start()
+            st.rerun()
 
 else:
     st.markdown("## Nhật ký hệ thống")

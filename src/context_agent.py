@@ -65,8 +65,13 @@ def _fallback_summary(video_title: str, search_context: str) -> str:
     )
 
 
-def _search_only_summary(video_title: str, search_tool) -> tuple[str, str]:
-    query = f"{video_title} viral trend short form video context"
+def _search_only_summary(
+    video_title: str, search_tool, *, recency_days: int = 7
+) -> tuple[str, str]:
+    query = (
+        f"{video_title} viral trend short form video context "
+        f"last {recency_days} days"
+    )
     search_context = _run_search(query, search_tool)
     return _fallback_summary(video_title, search_context), search_context
 
@@ -116,7 +121,12 @@ def _summarize_with_agent(
     return _fallback_summary(video_title, search_context)
 
 
-def enrich_trend_context(video_title: str, trend_folder: str | Path) -> Path:
+def enrich_trend_context(
+    video_title: str,
+    trend_folder: str | Path,
+    *,
+    recency_days: int = 7,
+) -> Path:
     """
     Search the web for context related to the video title and save a summary
     to trend_info.txt inside the trend folder.
@@ -140,7 +150,7 @@ def enrich_trend_context(video_title: str, trend_folder: str | Path) -> Path:
     search_tool = _get_search_tool()
     api_key = os.getenv("OPENAI_API_KEY", "").strip()
     search_context = _run_search(
-        f"{video_title} viral trend short form video context",
+        f"{video_title} viral trend short form video context last {recency_days} days",
         search_tool,
     )
 
@@ -148,7 +158,9 @@ def enrich_trend_context(video_title: str, trend_folder: str | Path) -> Path:
         logger.info(
             "OPENAI_API_KEY is missing or still a placeholder; using web search only."
         )
-        summary, search_context = _search_only_summary(video_title, search_tool)
+        summary, search_context = _search_only_summary(
+            video_title, search_tool, recency_days=recency_days
+        )
     else:
         llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.3, api_key=api_key)
         try:
@@ -157,7 +169,9 @@ def enrich_trend_context(video_title: str, trend_folder: str | Path) -> Path:
             logger.warning(
                 "OpenAI authentication failed; check OPENAI_API_KEY in .env"
             )
-            summary, search_context = _search_only_summary(video_title, search_tool)
+            summary, search_context = _search_only_summary(
+                video_title, search_tool, recency_days=recency_days
+            )
         except Exception as exc:
             logger.warning("Agent failed (%s); using search-only fallback", exc)
             try:

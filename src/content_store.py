@@ -29,11 +29,14 @@ def save_video_links(videos: list[dict[str, Any]], trend_root: str | Path) -> di
         title = video.get("title") or "Untitled"
         url = video.get("url") or ""
         platform = video.get("platform") or "unknown"
+        fmt = video.get("video_format") or "—"
+        src_kw = video.get("source_keyword") or "—"
         views = video.get("view_count")
         view_label = f"{views:,}" if isinstance(views, int) else "N/A"
         md_lines.append(
             f"{index}. **[{title}]({url})**  \n"
-            f"   - Platform: `{platform}` | Views: {view_label} | ID: `{video.get('video_id', '')}`\n"
+            f"   - Platform: `{platform}` | Format: `{fmt}` | Views: {view_label} | "
+            f"Keyword: `{src_kw}` | ID: `{video.get('video_id', '')}`\n"
         )
         txt_lines.append(f"{index}. {title}\n   {url}\n   [{platform}] views={view_label}\n")
 

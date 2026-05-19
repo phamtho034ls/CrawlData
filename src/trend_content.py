@@ -10,6 +10,76 @@ from urllib.parse import urlparse
 
 _URL_RE = re.compile(r"https?://[^\s\)\]\"\'<>]+")
 
+_VIDEO_PLATFORM_HOSTS = (
+    "youtube.com",
+    "youtu.be",
+    "m.youtube.com",
+    "music.youtube.com",
+    "tiktok.com",
+    "vm.tiktok.com",
+    "vt.tiktok.com",
+)
+
+
+def is_video_platform_url(url: str) -> bool:
+    """True for YouTube / TikTok (already covered by video scraper)."""
+    if not url:
+        return False
+    try:
+        host = urlparse(url.strip()).netloc.lower().replace("www.", "")
+    except Exception:
+        return False
+    return any(host == h or host.endswith(f".{h}") for h in _VIDEO_PLATFORM_HOSTS)
+
+
+def _normalize_url(url: str) -> str:
+    return url.strip().rstrip(".,;)")
+
+
+def _blocked_url_set(exclude_urls: list[str] | None = None) -> set[str]:
+    blocked: set[str] = set()
+    for raw in exclude_urls or []:
+        url = _normalize_url(raw)
+        if url:
+            blocked.add(url)
+    return blocked
+
+
+def filter_allowed_urls(
+    urls: list[str],
+    *,
+    exclude_urls: list[str] | None = None,
+) -> list[str]:
+    """Drop YouTube/TikTok and explicitly excluded URLs."""
+    blocked = _blocked_url_set(exclude_urls)
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in urls:
+        url = _normalize_url(raw)
+        if not url or url in seen:
+            continue
+        if is_video_platform_url(url) or url in blocked:
+            continue
+        seen.add(url)
+        out.append(url)
+    return out
+
+
+def sanitize_text_urls(
+    text: str,
+    *,
+    exclude_urls: list[str] | None = None,
+) -> str:
+    """Remove YouTube/TikTok (and excluded) URLs from free text."""
+    blocked = _blocked_url_set(exclude_urls)
+    cleaned = text or ""
+    for url in _unique_urls(cleaned):
+        if is_video_platform_url(url) or url in blocked:
+            cleaned = cleaned.replace(url, "")
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
+
 
 def _domain(url: str) -> str:
     try:
@@ -34,21 +104,23 @@ def build_text_items(
     summary_text: str,
     search_context: str = "",
     extra_items: list[dict[str, Any]] | None = None,
+    *,
+    exclude_urls: list[str] | None = None,
 ) -> list[dict[str, Any]]:
-    """Build a list of {title, url, text, type} for UI display."""
+    """Build a list of {title, url, text, type} for UI display (non-video-platform links only)."""
     items: list[dict[str, Any]] = []
-    summary = (summary_text or "").strip()
-    search = (search_context or "").strip()
+    summary = sanitize_text_urls((summary_text or "").strip(), exclude_urls=exclude_urls)
+    search = sanitize_text_urls((search_context or "").strip(), exclude_urls=exclude_urls)
 
     if summary:
         paragraphs = [p.strip() for p in re.split(r"\n\s*\n", summary) if p.strip()]
         if not paragraphs:
             paragraphs = [summary]
-        summary_urls = _unique_urls(summary)
+        summary_urls = filter_allowed_urls(_unique_urls(summary), exclude_urls=exclude_urls)
         for index, paragraph in enumerate(paragraphs, start=1):
-            url = summary_urls[index - 1] if index - 1 < len(summary_urls) else (
-                summary_urls[0] if summary_urls else ""
-            )
+            url = ""
+            if summary_urls:
+                url = summary_urls[min(index - 1, len(summary_urls) - 1)]
             items.append(
                 {
                     "id": len(items) + 1,
@@ -59,7 +131,7 @@ def build_text_items(
                 }
             )
 
-    for url in _unique_urls(search):
+    for url in filter_allowed_urls(_unique_urls(search), exclude_urls=exclude_urls):
         if any(item.get("url") == url for item in items):
             continue
         snippet = search
@@ -102,7 +174,13 @@ def load_trend_content(trend_root: str | Path) -> list[dict[str, Any]]:
     if path.is_file():
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
-            return data if isinstance(data, list) else []
+            if isinstance(data, list):
+                return [
+                    item
+                    for item in data
+                    if item.get("type") == "transcript"
+                    or not is_video_platform_url(item.get("url") or "")
+                ]
         except json.JSONDecodeError:
             pass
 

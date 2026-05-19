@@ -22,6 +22,8 @@ class PipelineProgress:
     expanded_keywords: list[str] = field(default_factory=list)
     keyword_states: dict[str, str] = field(default_factory=dict)
     keyword_video_counts: dict[str, int] = field(default_factory=dict)
+    keyword_videos: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    downloaded_videos: list[dict[str, Any]] = field(default_factory=list)
     current_keyword: str | None = None
     is_running: bool = False
 
@@ -35,6 +37,8 @@ class PipelineProgress:
         self.expanded_keywords = []
         self.keyword_states = {}
         self.keyword_video_counts = {}
+        self.keyword_videos = {}
+        self.downloaded_videos = []
         self.current_keyword = None
         self._emit()
 
@@ -62,6 +66,8 @@ class PipelineProgress:
         self.expanded_keywords = list(keywords)
         self.keyword_states = {kw: "pending" for kw in keywords}
         self.keyword_video_counts = {}
+        self.keyword_videos = {}
+        self.downloaded_videos = []
         self.current_keyword = None
         self.message = f"Đã tạo {len(keywords)} từ khóa — bắt đầu tìm video…"
         self._emit()
@@ -83,11 +89,27 @@ class PipelineProgress:
         self.message = f"Đang tìm [{index}/{total}]: «{keyword}»"
         self._emit()
 
-    def complete_keyword_search(self, keyword: str, video_count: int) -> None:
+    def complete_keyword_search(
+        self,
+        keyword: str,
+        video_count: int,
+        videos: list[dict[str, Any]] | None = None,
+    ) -> None:
         self.keyword_states[keyword] = "done"
         self.keyword_video_counts[keyword] = video_count
+        if videos:
+            self.keyword_videos[keyword] = list(videos)
         if self.current_keyword == keyword:
             self.current_keyword = None
+        self._emit()
+
+    def add_downloaded_video(self, video: dict[str, Any]) -> None:
+        """Append a successfully downloaded file (Module 3)."""
+        self.downloaded_videos.append(dict(video))
+        self._emit()
+
+    def set_downloaded_videos(self, videos: list[dict[str, Any]]) -> None:
+        self.downloaded_videos = [dict(v) for v in videos]
         self._emit()
 
     def fail_keyword_search(self, keyword: str) -> None:
@@ -138,7 +160,24 @@ class PipelineProgress:
             "expanded_keywords": list(self.expanded_keywords),
             "keyword_states": dict(self.keyword_states),
             "keyword_video_counts": dict(self.keyword_video_counts),
+            "keyword_videos": {k: list(v) for k, v in self.keyword_videos.items()},
+            "downloaded_videos": list(self.downloaded_videos),
+            "matched_videos": self.all_matched_videos(),
             "current_keyword": self.current_keyword,
             "keywords_done": done_kw,
             "keywords_total": len(self.expanded_keywords),
         }
+
+    def all_matched_videos(self) -> list[dict[str, Any]]:
+        """Flatten per-keyword matches preserving discovery order."""
+        out: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for kw in self.expanded_keywords:
+            for video in self.keyword_videos.get(kw, []):
+                key = (video.get("url") or video.get("video_id") or "").lower()
+                if key and key in seen:
+                    continue
+                if key:
+                    seen.add(key)
+                out.append(video)
+        return out

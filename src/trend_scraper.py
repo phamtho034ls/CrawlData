@@ -401,15 +401,12 @@ def _fetch_tiktok_for_keyword(keyword: str, *, config: ScraperConfig) -> list[Tr
 
 
 def scrape_keyword_pool(keyword: str, config: ScraperConfig) -> list[TrendVideo]:
-    """Gather up to `videos_per_keyword_search` videos across YT short/long + TikTok."""
-    pool: list[TrendVideo] = []
-    pool.extend(_fetch_youtube_for_keyword(keyword, config=config, want_format="short"))
-    pool.extend(_fetch_youtube_for_keyword(keyword, config=config, want_format="long"))
-    pool.extend(_fetch_tiktok_for_keyword(keyword, config=config))
-
-    pool = _dedupe_videos(pool)
-    pool.sort(key=lambda v: v.view_count or 0, reverse=True)
-    return pool[: config.videos_per_keyword_search]
+    """Top N videos per platform: YouTube Shorts, YouTube long, TikTok."""
+    limit = max(1, config.videos_per_platform)
+    shorts = _fetch_youtube_for_keyword(keyword, config=config, want_format="short")[:limit]
+    long_form = _fetch_youtube_for_keyword(keyword, config=config, want_format="long")[:limit]
+    tiktok = _fetch_tiktok_for_keyword(keyword, config=config)[:limit]
+    return _dedupe_videos(shorts + long_form + tiktok)
 
 
 def _dedupe_videos(videos: list[TrendVideo]) -> list[TrendVideo]:
@@ -428,9 +425,11 @@ def collect_videos_for_topic(
     topic: str,
     config: ScraperConfig | None = None,
     progress: PipelineProgress | None = None,
+    *,
+    keywords: list[str] | None = None,
 ) -> tuple[list[dict[str, Any]], list[str]]:
     """
-    Expand topic → keywords; per keyword keep top N by views.
+    Expand topic → keywords (or use provided list); per keyword keep top N by views.
     Returns (video dicts, keyword list).
     """
     config = config or ScraperConfig.from_env()
@@ -438,11 +437,18 @@ def collect_videos_for_topic(
     if not topic:
         raise ValueError("topic must be non-empty")
 
-    if progress:
-        progress.step("Đang mở rộng từ khóa (LLM)…")
-
-    keywords = expand_keywords(topic, config.keyword_count)
-    logger.info("Expanded '%s' → %d keywords: %s", topic, len(keywords), keywords)
+    if keywords:
+        keywords = [k.strip() for k in keywords if k and k.strip()]
+        if not keywords:
+            raise ValueError("keywords list is empty")
+        if progress:
+            progress.step(f"Dùng {len(keywords)} từ khóa từ AI Forecaster…")
+        logger.info("Using %d pre-selected keywords for '%s'", len(keywords), topic)
+    else:
+        if progress:
+            progress.step("Đang mở rộng từ khóa (LLM)…")
+        keywords = expand_keywords(topic, config.keyword_count)
+        logger.info("Expanded '%s' → %d keywords: %s", topic, len(keywords), keywords)
 
     if progress:
         progress.set_keywords(keywords)
@@ -454,7 +460,7 @@ def collect_videos_for_topic(
             progress.begin_keyword_search(kw, index, len(keywords), step=2 + index)
         try:
             pool = scrape_keyword_pool(kw, config)
-            top = pool[: config.top_videos_per_keyword]
+            top = pool
         except Exception as exc:
             logger.warning("Keyword scrape failed '%s': %s", kw, exc)
             if progress:
@@ -462,7 +468,11 @@ def collect_videos_for_topic(
             continue
 
         if progress:
-            progress.complete_keyword_search(kw, len(top))
+            progress.complete_keyword_search(
+                kw,
+                len(top),
+                videos=[v.model_dump() for v in top],
+            )
 
         logger.info(
             "Keyword '%s': pool=%d → top %d (views %s)",

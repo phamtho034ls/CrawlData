@@ -26,6 +26,14 @@ class PipelineProgress:
     downloaded_videos: list[dict[str, Any]] = field(default_factory=list)
     current_keyword: str | None = None
     is_running: bool = False
+    # Module 3: download + analyze (minute JSON, clips, keyframes)
+    in_media_module: bool = False
+    media_total: int = 0
+    media_done: int = 0
+    media_videos: list[dict[str, Any]] = field(default_factory=list)
+    media_current_index: int = 0
+    media_phase: str = ""
+    media_phase_message: str = ""
 
     def start(self, total_steps: int, message: str = "Bắt đầu pipeline") -> None:
         self.total_steps = max(1, total_steps)
@@ -40,6 +48,13 @@ class PipelineProgress:
         self.keyword_videos = {}
         self.downloaded_videos = []
         self.current_keyword = None
+        self.in_media_module = False
+        self.media_total = 0
+        self.media_done = 0
+        self.media_videos = []
+        self.media_current_index = 0
+        self.media_phase = ""
+        self.media_phase_message = ""
         self._emit()
 
     def finish(self, message: str = "Hoàn tất pipeline") -> None:
@@ -112,6 +127,118 @@ class PipelineProgress:
         self.downloaded_videos = [dict(v) for v in videos]
         self._emit()
 
+    def start_media_module(self, total: int) -> None:
+        """Begin Module 3 (download + speech-to-text + clips + keyframes)."""
+        self.in_media_module = True
+        self.media_total = max(0, total)
+        self.media_done = 0
+        self.media_videos = []
+        self.media_current_index = 0
+        self.media_phase = "starting"
+        self.media_phase_message = ""
+        self.message = f"Module 3: tải & phân tích {total} video…"
+        self._emit()
+
+    def _find_media_row(self, index: int) -> dict[str, Any] | None:
+        for row in self.media_videos:
+            if row.get("index") == index:
+                return row
+        return None
+
+    def begin_media_video(
+        self,
+        index: int,
+        total: int,
+        *,
+        title: str,
+        url: str,
+        platform: str,
+        source_keyword: str = "",
+    ) -> None:
+        self.media_current_index = index
+        self.media_total = total
+        self.media_phase = "downloading"
+        self.media_phase_message = "Đang tải video…"
+        short = (title or "Video")[:56]
+        self.message = f"Module 3 [{index}/{total}]: đang tải «{short}»"
+        row = {
+            "index": index,
+            "title": title,
+            "url": url,
+            "platform": platform,
+            "source_keyword": source_keyword,
+            "status": "downloading",
+            "phase_message": self.media_phase_message,
+            "video_path": "",
+            "content_json": "",
+            "clips_dir": "",
+            "minute_count": 0,
+            "keyframes_count": 0,
+        }
+        existing = self._find_media_row(index)
+        if existing:
+            existing.update(row)
+        else:
+            self.media_videos.append(row)
+        self._emit()
+
+    def set_media_phase(
+        self,
+        index: int,
+        phase: str,
+        message: str,
+        *,
+        total: int | None = None,
+    ) -> None:
+        if total is not None:
+            self.media_total = total
+        self.media_current_index = index
+        self.media_phase = phase
+        self.media_phase_message = message
+        row = self._find_media_row(index)
+        if row:
+            row["status"] = phase
+            row["phase_message"] = message
+        phase_labels = {
+            "downloading": "đang tải",
+            "analyzing": "đang phân tích (STT + JSON + clip/phút)",
+            "keyframes": "đang trích keyframe",
+            "done": "hoàn tất",
+            "download_failed": "tải thất bại",
+            "analyze_failed": "phân tích lỗi một phần",
+        }
+        label = phase_labels.get(phase, phase)
+        short = (row.get("title") if row else "") or "Video"
+        short = short[:56]
+        self.message = f"Module 3 [{index}/{self.media_total}]: {label} — «{short}»"
+        self._emit()
+
+    def complete_media_video(self, index: int, details: dict[str, Any]) -> None:
+        row = self._find_media_row(index)
+        if not row:
+            return
+        row.update(details)
+        row["status"] = details.get("status", "done")
+        row["phase_message"] = details.get("phase_message", "Hoàn tất")
+        self.media_done = sum(
+            1
+            for v in self.media_videos
+            if v.get("status")
+            in ("done", "download_failed", "analyze_failed")
+        )
+        self.media_phase = row["status"]
+        self.media_phase_message = row["phase_message"]
+        self._emit()
+
+    def finish_media_module(self, downloaded: list[dict[str, Any]]) -> None:
+        self.in_media_module = False
+        self.media_phase = "finished"
+        self.media_done = self.media_total
+        self.set_downloaded_videos(downloaded)
+        ok = sum(1 for v in self.media_videos if v.get("status") == "done")
+        self.message = f"Module 3 xong: {ok}/{self.media_total} video thành công"
+        self._emit()
+
     def fail_keyword_search(self, keyword: str) -> None:
         self.keyword_states[keyword] = "error"
         self.keyword_video_counts[keyword] = 0
@@ -124,7 +251,16 @@ class PipelineProgress:
             self.on_update(self.to_dict())
 
     @property
+    def media_fraction(self) -> float:
+        if self.media_total <= 0:
+            return 0.0
+        return min(1.0, self.media_done / self.media_total)
+
+    @property
     def fraction(self) -> float:
+        if self.in_media_module and self.media_total > 0:
+            base = 0.82 if self.expanded_keywords else 0.55
+            return min(1.0, base + self.media_fraction * (1.0 - base))
         if self.expanded_keywords:
             kw_done = sum(
                 1 for s in self.keyword_states.values() if s in ("done", "error")
@@ -166,6 +302,14 @@ class PipelineProgress:
             "current_keyword": self.current_keyword,
             "keywords_done": done_kw,
             "keywords_total": len(self.expanded_keywords),
+            "in_media_module": self.in_media_module,
+            "media_total": self.media_total,
+            "media_done": self.media_done,
+            "media_fraction": self.media_fraction,
+            "media_videos": list(self.media_videos),
+            "media_current_index": self.media_current_index,
+            "media_phase": self.media_phase,
+            "media_phase_message": self.media_phase_message,
         }
 
     def all_matched_videos(self) -> list[dict[str, Any]]:

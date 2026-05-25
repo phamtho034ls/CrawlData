@@ -120,6 +120,18 @@ _KEYWORD_ICONS = {
     "error": "⚠️ Lỗi",
 }
 
+_MEDIA_STATUS_ICONS = {
+    "pending": "⏳",
+    "downloading": "⬇️",
+    "analyzing": "🎙️",
+    "keyframes": "🖼️",
+    "done": "✅",
+    "download_failed": "❌",
+    "analyze_failed": "⚠️",
+    "starting": "▶️",
+    "finished": "✅",
+}
+
 
 def _render_matched_videos(data: dict[str, Any], placeholder) -> None:
     """Videos that passed scrape filters (per keyword), shown as they are found."""
@@ -155,37 +167,82 @@ def _render_matched_videos(data: dict[str, Any], placeholder) -> None:
         )
 
 
+def _render_media_module_progress(data: dict[str, Any], placeholder) -> None:
+    """Module 3: per-video download + analyze progress."""
+    media_rows = data.get("media_videos") or []
+    if not media_rows and not data.get("in_media_module"):
+        placeholder.empty()
+        return
+
+    done = int(data.get("media_done") or 0)
+    total = int(data.get("media_total") or 0)
+    media_frac = float(data.get("media_fraction") or 0.0)
+    phase_msg = data.get("media_phase_message") or data.get("message") or ""
+
+    with placeholder.container():
+        st.markdown("**Module 3: Tải video & phân tích**")
+        if total > 0:
+            st.progress(
+                media_frac,
+                text=f"{done}/{total} video · {phase_msg[:80]}",
+            )
+        elif data.get("in_media_module"):
+            st.caption(phase_msg or "Đang khởi động Module 3…")
+
+        table_rows = []
+        for row in media_rows:
+            status = row.get("status") or "pending"
+            icon = _MEDIA_STATUS_ICONS.get(status, "•")
+            table_rows.append(
+                {
+                    "#": row.get("index"),
+                    "": icon,
+                    "Tiêu đề": (row.get("title") or "—")[:50],
+                    "Nền tảng": (row.get("platform") or "?").upper(),
+                    "Bước": row.get("phase_message") or status,
+                    "Phút JSON": row.get("minute_count") or 0,
+                    "Keyframes": row.get("keyframes_count") or 0,
+                    "File": (row.get("video_path") or "")[:80],
+                }
+            )
+
+        if table_rows:
+            st.dataframe(
+                pd.DataFrame(table_rows),
+                use_container_width=True,
+                hide_index=True,
+                height=min(280, 38 + len(table_rows) * 36),
+            )
+        else:
+            st.caption("_Chưa có video trong hàng đợi Module 3._")
+
+
 def _render_downloaded_videos(data: dict[str, Any], placeholder) -> None:
-    """Local MP4 files after Module 3 download."""
+    """Summary of completed Module 3 outputs (paths)."""
     downloaded = data.get("downloaded_videos") or []
-    if not downloaded:
+    media_rows = [r for r in (data.get("media_videos") or []) if r.get("status") == "done"]
+    items = downloaded if downloaded else media_rows
+    if not items:
         placeholder.empty()
         return
 
     rows = []
-    for index, item in enumerate(downloaded, start=1):
+    for index, item in enumerate(items, start=1):
         rows.append(
             {
                 "#": index,
-                "Tiêu đề": (item.get("title") or "—")[:60],
+                "Tiêu đề": (item.get("title") or "—")[:50],
                 "Nền tảng": (item.get("platform") or "?").upper(),
-                "Từ khóa": item.get("source_keyword") or "—",
-                "File": item.get("video_path") or "",
-                "Link": item.get("url") or "",
+                "Phút": item.get("minute_count") or "—",
+                "JSON": (item.get("content_json") or "")[-40:] or "—",
+                "Clips": (item.get("clips_dir") or "")[-40:] or "—",
+                "File": (item.get("video_path") or "")[-50:] or "—",
             }
         )
 
     with placeholder.container():
-        st.markdown(f"**Video đã tải xuống ({len(downloaded)})**")
-        st.dataframe(
-            pd.DataFrame(rows),
-            column_config={
-                "Link": st.column_config.LinkColumn("Nguồn", display_text="▶ Mở"),
-                "File": st.column_config.TextColumn("Đường dẫn file", width="large"),
-            },
-            use_container_width=True,
-            hide_index=True,
-        )
+        st.markdown(f"**Kết quả Module 3 ({len(items)} video)**")
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
 
 def _render_keyword_list(data: dict[str, Any], placeholder) -> None:
@@ -387,6 +444,7 @@ def _paint_progress_ui(
     )
     _render_keyword_list(data, keyword_list_placeholder)
     _render_matched_videos(data, widgets["matched_videos_placeholder"])
+    _render_media_module_progress(data, widgets["media_module_placeholder"])
     _render_downloaded_videos(data, widgets["downloaded_videos_placeholder"])
     if log_lines:
         log_box.code("\n".join(log_lines[-10:]), language="text")
@@ -751,6 +809,7 @@ elif page == "collect":
         log_box = st.empty()
 
     matched_videos_placeholder = st.empty()
+    media_module_placeholder = st.empty()
     downloaded_videos_placeholder = st.empty()
 
     ui_widgets = {
@@ -761,6 +820,7 @@ elif page == "collect":
         "keyword_list_placeholder": keyword_list_placeholder,
         "log_box": log_box,
         "matched_videos_placeholder": matched_videos_placeholder,
+        "media_module_placeholder": media_module_placeholder,
         "downloaded_videos_placeholder": downloaded_videos_placeholder,
     }
 
@@ -825,7 +885,16 @@ elif page == "collect":
             if result.get("mode") == "full":
                 n_dl = int(media.get("videos_downloaded") or 0)
                 if n_dl:
-                    st.success(f"Module 3: đã tải **{n_dl}** video vào thư mục `Videos/`.")
+                    n_json = len(media.get("minute_content_files") or [])
+                    st.success(
+                        f"Module 3: đã tải **{n_dl}** video vào `Videos/`"
+                        + (
+                            f", **{n_json}** file JSON nội dung/phút trong `Content/`, "
+                            "clip theo phút trong `Videos/clips/`."
+                            if n_json
+                            else "."
+                        )
+                    )
                 elif result.get("media_download_error"):
                     st.warning(result["media_download_error"])
             scraped = result.get("scraped_videos") or []
@@ -836,8 +905,13 @@ elif page == "collect":
                 kw_counts[kw] = kw_counts.get(kw, 0) + 1
                 kw_videos.setdefault(kw, []).append(video)
             media = result.get("media_module") or {}
-            downloaded_rows = [
-                {
+            downloaded_rows = []
+            media_rows = []
+            for idx, item in enumerate(media.get("processed") or [], start=1):
+                if item.get("status") != "ok":
+                    continue
+                row = {
+                    "index": idx,
                     "title": item.get("title") or "Video",
                     "url": item.get("url") or "",
                     "platform": item.get("platform") or "",
@@ -846,10 +920,15 @@ elif page == "collect":
                         (v.get("source_keyword") for v in scraped if v.get("url") == item.get("url")),
                         "",
                     ),
+                    "content_json": item.get("content_json") or "",
+                    "clips_dir": item.get("clips_dir") or "",
+                    "minute_count": item.get("minute_count") or 0,
+                    "status": "done",
+                    "phase_message": "Hoàn tất",
+                    "keyframes_count": len(item.get("keyframes") or []),
                 }
-                for item in media.get("processed") or []
-                if item.get("status") == "ok"
-            ]
+                downloaded_rows.append(row)
+                media_rows.append(row)
             final_data = {
                 "expanded_keywords": result.get("expanded_keywords") or [],
                 "keyword_states": {
@@ -859,6 +938,11 @@ elif page == "collect":
                 "keyword_videos": kw_videos,
                 "matched_videos": scraped,
                 "downloaded_videos": downloaded_rows,
+                "media_videos": media_rows,
+                "media_total": len(media_rows),
+                "media_done": len(media_rows),
+                "media_fraction": 1.0 if media_rows else 0.0,
+                "in_media_module": False,
                 "keywords_done": len(result.get("expanded_keywords") or []),
                 "keywords_total": len(result.get("expanded_keywords") or []),
                 "fraction": 1.0,
@@ -866,6 +950,7 @@ elif page == "collect":
             }
             _render_keyword_list(final_data, keyword_list_placeholder)
             _render_matched_videos(final_data, matched_videos_placeholder)
+            _render_media_module_progress(final_data, media_module_placeholder)
             _render_downloaded_videos(final_data, downloaded_videos_placeholder)
             st.session_state.last_result = result
             st.session_state.selected_trend_id = Path(result["trend_root"]).name

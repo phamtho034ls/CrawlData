@@ -7,6 +7,7 @@ from src.prefect_bootstrap import configure_prefect
 configure_prefect()
 
 import json
+import os
 from pathlib import Path
 from typing import Any, Literal
 
@@ -20,6 +21,10 @@ from src.trend_content import append_transcript_item, build_text_items, save_tre
 from src.audio_transcriber import extract_audio_from_video, transcribe_audio
 from src.image_extractor import extract_video_keyframes
 from src.video_downloader import download_trend_video
+from src.video_minute_splitter import (
+    process_video_minute_split,
+    transcript_text_from_minute_payload,
+)
 from src.web_searcher import search_trend_articles
 from src.pipeline_logging import setup_logging
 from src.pipeline_progress import PipelineProgress
@@ -137,9 +142,10 @@ def process_media_assets(
     folder_paths: dict[str, str],
     *,
     max_videos: int | None = 3,
+    progress: PipelineProgress | None = None,
 ) -> dict[str, Any]:
     """
-    Module 3: download videos → extract audio → transcribe → keyframe images.
+    Module 3: download videos → minute JSON + clips → transcript → keyframes.
     """
     log = get_run_logger()
     videos_dir = folder_paths["videos_dir"]
@@ -155,9 +161,20 @@ def process_media_assets(
     if max_videos is not None and max_videos > 0:
         ranked = ranked[:max_videos]
 
+    total_videos = len(ranked)
+    if progress and total_videos:
+        progress.start_media_module(total_videos)
+
     processed: list[dict[str, Any]] = []
     transcript_sections: list[str] = []
     all_keyframes: list[str] = []
+    minute_content_files: list[str] = []
+    minute_clips_dirs: list[str] = []
+    minute_split_enabled = os.getenv("PIPELINE_MINUTE_SPLIT", "1").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+    }
 
     for index, item in enumerate(ranked, start=1):
         url = (item.get("url") or "").strip()
@@ -167,6 +184,17 @@ def process_media_assets(
             continue
 
         platform = _platform_from_trend_item(item)
+        source_keyword = item.get("source_keyword") or ""
+        if progress:
+            progress.begin_media_video(
+                index,
+                total_videos,
+                title=title,
+                url=url,
+                platform=platform,
+                source_keyword=source_keyword,
+            )
+
         log.info("[%d/%d] Downloading %s: %s", index, len(ranked), platform, url)
 
         video_path = download_trend_video(url, videos_dir, platform=platform)
@@ -181,27 +209,104 @@ def process_media_assets(
                     "error": "no_file",
                 }
             )
+            if progress:
+                progress.complete_media_video(
+                    index,
+                    {
+                        "status": "download_failed",
+                        "phase_message": "Không tải được file video",
+                    },
+                )
             continue
 
         log.info("Downloaded to %s (%s bytes)", video_path, Path(video_path).stat().st_size)
-
-        audio_path = Path(videos_dir) / f"_audio_{index}.wav"
-        try:
-            log.info("Extracting audio → %s", audio_path.name)
-            extract_audio_from_video(video_path, audio_path)
-            log.info("Transcribing audio (faster-whisper)")
-            transcribe_audio(audio_path, transcript_path)
-            segment_text = transcript_path.read_text(encoding="utf-8").strip()
-            transcript_sections.append(
-                f"## Video {index}: {title}\nURL: {url}\n\n{segment_text}"
+        if progress:
+            progress.set_media_phase(
+                index,
+                "downloading",
+                f"Đã tải xong ({Path(video_path).stat().st_size // 1024} KB)",
+                total=total_videos,
             )
-        except Exception as exc:
-            log.warning("Audio/transcription failed for %s: %s", url, exc)
-        finally:
-            if audio_path.is_file():
-                audio_path.unlink(missing_ok=True)
+
+        content_json_path: str | None = None
+        clips_dir: str | None = None
+        minute_count = 0
+        transcript_ok = False
+
+        if minute_split_enabled:
+            try:
+                if progress:
+                    progress.set_media_phase(
+                        index,
+                        "analyzing",
+                        "Speech-to-text → JSON theo phút → cắt clip…",
+                        total=total_videos,
+                    )
+                log.info("Minute split: speech-to-text JSON + per-minute clips")
+                minute_payload = process_video_minute_split(
+                    video_path,
+                    trend_root=trend_root,
+                    language=None,
+                )
+                content_json_path = minute_payload.get("content_json")
+                clips_dir = minute_payload.get("clips_dir")
+                minute_count = len(minute_payload.get("minutes") or [])
+                if content_json_path:
+                    minute_content_files.append(content_json_path)
+                if clips_dir:
+                    minute_clips_dirs.append(clips_dir)
+                segment_text = transcript_text_from_minute_payload(minute_payload)
+                transcript_sections.append(
+                    f"## Video {index}: {title}\nURL: {url}\n\n{segment_text}"
+                )
+                transcript_ok = True
+                log.info(
+                    "Minute content: %s (%d phút, clips → %s)",
+                    content_json_path,
+                    minute_count,
+                    clips_dir,
+                )
+            except Exception as exc:
+                log.warning("Minute split failed for %s: %s", url, exc)
+                if progress:
+                    progress.set_media_phase(
+                        index,
+                        "analyze_failed",
+                        f"Phân tích theo phút lỗi: {exc}",
+                        total=total_videos,
+                    )
+
+        if not transcript_ok:
+            if progress:
+                progress.set_media_phase(
+                    index,
+                    "analyzing",
+                    "Fallback: transcribe toàn bộ (transcript.txt)…",
+                    total=total_videos,
+                )
+            audio_path = Path(videos_dir) / f"_audio_{index}.wav"
+            try:
+                log.info("Fallback transcript → %s", audio_path.name)
+                extract_audio_from_video(video_path, audio_path)
+                transcribe_audio(audio_path, transcript_path)
+                segment_text = transcript_path.read_text(encoding="utf-8").strip()
+                transcript_sections.append(
+                    f"## Video {index}: {title}\nURL: {url}\n\n{segment_text}"
+                )
+            except Exception as exc:
+                log.warning("Audio/transcription failed for %s: %s", url, exc)
+            finally:
+                if audio_path.is_file():
+                    audio_path.unlink(missing_ok=True)
 
         try:
+            if progress:
+                progress.set_media_phase(
+                    index,
+                    "keyframes",
+                    "Trích keyframe (scene detection)…",
+                    total=total_videos,
+                )
             log.info("Extracting keyframes → %s", images_dir)
             keyframes = extract_video_keyframes(video_path, images_dir)
             all_keyframes.extend(keyframes)
@@ -210,6 +315,12 @@ def process_media_assets(
             log.warning("Keyframe extraction failed for %s: %s", url, exc)
             keyframes = []
 
+        final_status = "ok" if transcript_ok else "analyze_failed"
+        phase_msg = (
+            f"Xong: {minute_count} phút JSON, {len(keyframes)} keyframes"
+            if transcript_ok
+            else "Tải OK; transcript/phân tích chưa đủ"
+        )
         processed.append(
             {
                 "url": url,
@@ -217,9 +328,49 @@ def process_media_assets(
                 "title": title,
                 "video_path": video_path,
                 "keyframes": keyframes,
+                "content_json": content_json_path,
+                "clips_dir": clips_dir,
+                "minute_count": minute_count,
                 "status": "ok",
             }
         )
+        if progress:
+            progress.complete_media_video(
+                index,
+                {
+                    "status": "done" if transcript_ok else "analyze_failed",
+                    "phase_message": phase_msg,
+                    "video_path": video_path,
+                    "content_json": content_json_path or "",
+                    "clips_dir": clips_dir or "",
+                    "minute_count": minute_count,
+                    "keyframes_count": len(keyframes),
+                },
+            )
+
+    if progress and total_videos:
+        downloaded_rows = [
+            {
+                "title": item.get("title") or "Video",
+                "url": item.get("url") or "",
+                "platform": item.get("platform") or "",
+                "video_path": item.get("video_path") or "",
+                "source_keyword": next(
+                    (
+                        v.get("source_keyword")
+                        for v in trend_data_list
+                        if v.get("url") == item.get("url")
+                    ),
+                    "",
+                ),
+                "content_json": item.get("content_json") or "",
+                "clips_dir": item.get("clips_dir") or "",
+                "minute_count": item.get("minute_count") or 0,
+            }
+            for item in processed
+            if item.get("status") == "ok"
+        ]
+        progress.finish_media_module(downloaded_rows)
 
     if transcript_sections:
         combined = "\n\n---\n\n".join(transcript_sections) + "\n"
@@ -246,6 +397,9 @@ def process_media_assets(
         "processed": processed,
         "transcript_path": str(transcript_path.resolve()),
         "keyframe_paths": all_keyframes,
+        "minute_content_files": minute_content_files,
+        "minute_clips_dirs": minute_clips_dirs,
+        "minute_split_enabled": minute_split_enabled,
         "videos_attempted": len(ranked),
         "videos_downloaded": ok_count,
     }
@@ -373,28 +527,9 @@ def run_pipeline(
             videos,
             paths,
             max_videos=3,
+            progress=progress,
         )
         result["media_module"] = media_result
-        if progress:
-            downloaded_rows = [
-                {
-                    "title": item.get("title") or "Video",
-                    "url": item.get("url") or "",
-                    "platform": item.get("platform") or "",
-                    "video_path": item.get("video_path") or "",
-                    "source_keyword": next(
-                        (
-                            v.get("source_keyword")
-                            for v in videos
-                            if v.get("url") == item.get("url")
-                        ),
-                        "",
-                    ),
-                }
-                for item in media_result.get("processed") or []
-                if item.get("status") == "ok"
-            ]
-            progress.set_downloaded_videos(downloaded_rows)
         result["transcript_path"] = media_result.get("transcript_path")
         ok_videos = [
             p for p in media_result.get("processed") or [] if p.get("status") == "ok"

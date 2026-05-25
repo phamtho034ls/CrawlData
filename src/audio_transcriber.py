@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 from pathlib import Path
+from typing import Any
 
 import ffmpeg
 from dotenv import load_dotenv
@@ -65,21 +66,17 @@ def _format_timestamp(seconds: float) -> str:
     return f"{minutes:02d}:{secs:06.3f}"
 
 
-def transcribe_audio(
+def transcribe_audio_segments(
     audio_path: str | Path,
-    output_txt_path: str | Path,
     *,
-    language: str | None = "vi",
-) -> Path:
+    language: str | None = None,
+) -> tuple[list[dict[str, Any]], str]:
     """
-    Transcribe WAV with faster-whisper; write timestamped lines to output_txt_path.
+    Transcribe WAV; return segment dicts (start/end/text in seconds) and detected language.
     """
     audio_file = Path(audio_path)
     if not audio_file.is_file():
         raise FileNotFoundError(f"Audio not found: {audio_file}")
-
-    output_file = Path(output_txt_path)
-    output_file.parent.mkdir(parents=True, exist_ok=True)
 
     device = resolve_whisper_device()
     compute_type = "float16" if device == "cuda" else "int8"
@@ -99,15 +96,42 @@ def transcribe_audio(
     )
 
     detected = getattr(info, "language", None) or "unknown"
-    lines = [f"# Language: {detected}", ""]
+    rows: list[dict[str, Any]] = []
     for segment in segments:
-        start = _format_timestamp(segment.start)
-        end = _format_timestamp(segment.end)
         text = (segment.text or "").strip()
-        if text:
-            lines.append(f"[{start} -> {end}] {text}")
+        if not text:
+            continue
+        rows.append(
+            {
+                "start": round(float(segment.start), 3),
+                "end": round(float(segment.end), 3),
+                "text": text,
+            }
+        )
+    logger.info("Transcribed %d speech segments (lang=%s)", len(rows), detected)
+    return rows, detected
+
+
+def transcribe_audio(
+    audio_path: str | Path,
+    output_txt_path: str | Path,
+    *,
+    language: str | None = "vi",
+) -> Path:
+    """
+    Transcribe WAV with faster-whisper; write timestamped lines to output_txt_path.
+    """
+    output_file = Path(output_txt_path)
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+
+    rows, detected = transcribe_audio_segments(audio_path, language=language)
+    lines = [f"# Language: {detected}", ""]
+    for row in rows:
+        start = _format_timestamp(row["start"])
+        end = _format_timestamp(row["end"])
+        lines.append(f"[{start} -> {end}] {row['text']}")
 
     body = "\n".join(lines).strip() + "\n"
     output_file.write_text(body, encoding="utf-8")
-    logger.info("Transcript saved to %s (%d segments)", output_file, len(lines) - 2)
+    logger.info("Transcript saved to %s (%d segments)", output_file, len(rows))
     return output_file.resolve()

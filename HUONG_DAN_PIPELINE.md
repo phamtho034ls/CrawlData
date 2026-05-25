@@ -140,7 +140,11 @@ Mỗi lần chạy tạo (hoặc tiếp tục) thư mục:
 
 data_trends/<YYYY-MM-DD>_Topic_<keyword_sanitized>/
 ├── Videos/
-│   └── video_links.txt
+│   ├── video_links.txt
+│   ├── <video_id>.mp4        # mode=full
+│   └── clips/<video_id>/     # minute_01.mp4, minute_02.mp4, ...
+├── Content/
+│   └── <video_id>.json       # nội dung theo phút (noi_dung_theo_phut)
 ├── Images/
 ├── video_links.json
 ├── video_links.md
@@ -163,7 +167,9 @@ CrawlData/
 │   ├── trend_scraper.py  # YouTube + TikTok
 │   ├── context_agent.py  # Tóm tắt trend (OpenAI / search)
 │   ├── content_store.py  # Lưu link
-│   ├── media_processor.py# Download + Whisper
+│   ├── video_minute_splitter.py  # JSON theo phút + cắt clip (mode=full)
+│   ├── audio_transcriber.py      # faster-whisper
+│   ├── video_downloader.py
 │   └── ...
 ├── data_trends/          # Output
 └── logs/

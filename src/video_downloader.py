@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import shutil
+import time
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +29,15 @@ _DESKTOP_USER_AGENT = (
     "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 )
 
+# After Chrome cookie DB lock, skip browser cookies for remaining downloads in this process.
+_browser_cookies_disabled = False
+
+
+def reset_download_session() -> None:
+    """Reset per-process download state (e.g. before a new pipeline batch)."""
+    global _browser_cookies_disabled
+    _browser_cookies_disabled = False
+
 
 def _ffmpeg_location() -> str | None:
     """Resolve ffmpeg binary (PATH or common WinGet install on Windows)."""
@@ -50,10 +60,37 @@ def _cookies_browser() -> str:
     return os.getenv("YTDLP_COOKIES_FROM_BROWSER", "").strip()
 
 
+def _cookies_file() -> str | None:
+    path = os.getenv("YTDLP_COOKIES_FILE", "").strip()
+    if path and Path(path).is_file():
+        return str(Path(path).resolve())
+    return None
+
+
+def _youtube_player_clients() -> list[str]:
+    raw = os.getenv("YTDLP_YOUTUBE_CLIENTS", "android,web").strip()
+    clients = [c.strip() for c in raw.split(",") if c.strip()]
+    return clients or ["android", "web"]
+
+
+def _download_delay_seconds() -> float:
+    try:
+        return max(0.0, float(os.getenv("YTDLP_DOWNLOAD_DELAY_SEC", "4")))
+    except ValueError:
+        return 4.0
+
+
+def notify_between_downloads() -> None:
+    """Sleep between consecutive video downloads to reduce YouTube bot blocks."""
+    delay = _download_delay_seconds()
+    if delay > 0:
+        time.sleep(delay)
+
+
 def _apply_common_opts(
     opts: dict[str, Any],
     *,
-    use_browser_cookies: bool,
+    cookie_mode: str,
 ) -> dict[str, Any]:
     ffmpeg = _ffmpeg_location()
     if ffmpeg:
@@ -64,7 +101,12 @@ def _apply_common_opts(
             "Install ffmpeg for best quality merges."
         )
 
-    if use_browser_cookies:
+    if cookie_mode == "file":
+        cookie_path = _cookies_file()
+        if cookie_path:
+            opts["cookiefile"] = cookie_path
+            logger.info("yt-dlp using cookies file: %s", cookie_path)
+    elif cookie_mode == "browser":
         browser = _cookies_browser()
         if browser:
             opts["cookiesfrombrowser"] = (browser,)
@@ -139,9 +181,11 @@ def _attempt_download(
     out_dir: Path,
     ydl_opts: dict[str, Any],
     *,
-    use_browser_cookies: bool,
+    cookie_mode: str,
 ) -> str | None:
-    opts = _apply_common_opts(dict(ydl_opts), use_browser_cookies=use_browser_cookies)
+    global _browser_cookies_disabled
+
+    opts = _apply_common_opts(dict(ydl_opts), cookie_mode=cookie_mode)
     opts["outtmpl"] = str(out_dir.resolve() / "%(id)s.%(ext)s")
     opts.setdefault("noplaylist", True)
 
@@ -155,10 +199,17 @@ def _attempt_download(
             "Download finished but no video file found in %s for %s", out_dir, url
         )
     except DownloadError as exc:
+        msg = str(exc).lower()
+        if cookie_mode == "browser" and "cookie" in msg:
+            _browser_cookies_disabled = True
+            logger.warning(
+                "Browser cookies unavailable (close Chrome or set YTDLP_COOKIES_FILE): %s",
+                exc,
+            )
         logger.warning(
             "yt-dlp DownloadError for %s (cookies=%s): %s",
             url,
-            use_browser_cookies,
+            cookie_mode,
             exc,
         )
         raise
@@ -167,32 +218,43 @@ def _attempt_download(
     return None
 
 
+def _cookie_modes_for_attempt() -> list[str]:
+    modes: list[str] = []
+    if _cookies_file():
+        modes.append("file")
+    if _cookies_browser() and not _browser_cookies_disabled:
+        modes.append("browser")
+    modes.append("none")
+    return modes
+
+
 def _download_with_opts(url: str, out_dir: Path, ydl_opts: dict[str, Any]) -> str | None:
-    """
-    Try download; if browser cookies are configured but fail, retry without them.
-    """
+    """Try cookie file → browser → none; each with configured YouTube player clients."""
     out_dir = out_dir.resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
-    browser = _cookies_browser()
-    cookie_attempts = [True, False] if browser else [False]
 
-    for index, use_cookies in enumerate(cookie_attempts):
-        try:
-            path = _attempt_download(
-                url, out_dir, ydl_opts, use_browser_cookies=use_cookies
-            )
-            if path:
-                if index > 0:
-                    logger.info("Download succeeded without browser cookies: %s", url)
-                return path
-        except DownloadError:
-            if use_cookies and index + 1 < len(cookie_attempts):
-                logger.warning(
-                    "Browser cookie download failed for %s — retrying without cookies",
-                    url,
-                )
+    is_youtube = "youtube.com" in url.lower() or "youtu.be" in url.lower()
+    clients = _youtube_player_clients() if is_youtube else [""]
+
+    for client in clients:
+        opts = dict(ydl_opts)
+        if client:
+            opts["extractor_args"] = {"youtube": {"player_client": [client]}}
+
+        for cookie_mode in _cookie_modes_for_attempt():
+            try:
+                path = _attempt_download(url, out_dir, opts, cookie_mode=cookie_mode)
+                if path:
+                    if cookie_mode != "file" or client != clients[0]:
+                        logger.info(
+                            "Download succeeded (client=%s, cookies=%s): %s",
+                            client or "default",
+                            cookie_mode,
+                            url,
+                        )
+                    return path
+            except DownloadError:
                 continue
-            return None
     return None
 
 

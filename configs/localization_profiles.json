@@ -1,0 +1,30 @@
+{
+  "profiles": [
+    {
+      "name": "short_vi_60s",
+      "platform": "tiktok",
+      "style": "short-form viral",
+      "tone": "energetic",
+      "target_duration_sec": 60,
+      "max_script_segments": 6,
+      "segment_duration_sec": 10,
+      "burn_subtitles": true,
+      "canvas_width": 1080,
+      "canvas_height": 1920,
+      "fps": 30
+    },
+    {
+      "name": "yt_vi_180s",
+      "platform": "youtube",
+      "style": "educational explainer",
+      "tone": "clear and informative",
+      "target_duration_sec": 180,
+      "max_script_segments": 12,
+      "segment_duration_sec": 15,
+      "burn_subtitles": true,
+      "canvas_width": 1080,
+      "canvas_height": 1920,
+      "fps": 30
+    }
+  ]
+}

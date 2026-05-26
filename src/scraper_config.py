@@ -14,6 +14,8 @@ class ScraperConfig:
     videos_per_platform: int = 5
     videos_per_keyword_search: int = 20
     top_videos_per_keyword: int = 10
+    # 0 = unlimited; when unset in env, scrape-mode default is applied in run_pipeline
+    max_videos: int = 0
 
     @classmethod
     def from_env(cls, **overrides: int) -> ScraperConfig:
@@ -24,6 +26,7 @@ class ScraperConfig:
             videos_per_platform=int(os.getenv("VIDEOS_PER_PLATFORM", "5")),
             videos_per_keyword_search=int(os.getenv("VIDEOS_PER_KEYWORD_SEARCH", "20")),
             top_videos_per_keyword=int(os.getenv("TOP_VIDEOS_PER_KEYWORD", "10")),
+            max_videos=int(os.getenv("PIPELINE_MAX_VIDEOS", "0")),
         )
         if not overrides:
             return base

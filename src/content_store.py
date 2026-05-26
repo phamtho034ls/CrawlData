@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -55,6 +56,62 @@ def load_video_links(trend_root: str | Path) -> list[dict[str, Any]]:
     if not json_path.is_file():
         return []
     return json.loads(json_path.read_text(encoding="utf-8"))
+
+
+def parse_video_links_txt(text: str) -> list[dict[str, Any]]:
+    """
+    Parse Videos/video_links.txt format:
+      1. Title
+         https://...
+         [youtube] views=1,234
+    """
+    videos: list[dict[str, Any]] = []
+    pending_title: str | None = None
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        if line.startswith("http://") or line.startswith("https://"):
+            platform = "tiktok" if "tiktok.com" in line.lower() else "youtube"
+            item: dict[str, Any] = {
+                "url": line,
+                "title": pending_title or f"Video {len(videos) + 1}",
+                "platform": platform,
+            }
+            videos.append(item)
+            pending_title = None
+            continue
+
+        meta = re.match(r"^\[(\w+)\]\s*views=([\d,]+)", line, flags=re.IGNORECASE)
+        if meta and videos:
+            videos[-1]["platform"] = meta.group(1).lower()
+            try:
+                videos[-1]["view_count"] = int(meta.group(2).replace(",", ""))
+            except ValueError:
+                pass
+            continue
+
+        title_match = re.match(r"^\d+\.\s*(.+)$", line)
+        if title_match:
+            pending_title = title_match.group(1).strip()
+
+    return videos
+
+
+def load_videos_for_trend(trend_root: str | Path) -> list[dict[str, Any]]:
+    """Load videos from video_links.json, else parse Videos/video_links.txt."""
+    root = Path(trend_root)
+    videos = load_video_links(root)
+    if videos:
+        return videos
+
+    txt_path = root / "Videos" / "video_links.txt"
+    if txt_path.is_file():
+        return parse_video_links_txt(txt_path.read_text(encoding="utf-8"))
+
+    return []
 
 
 def read_text_file(path: str | Path, default: str = "") -> str:

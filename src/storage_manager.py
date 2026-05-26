@@ -88,6 +88,27 @@ class StorageManager:
             "images_dir": str(self.images_dir.resolve()),
         }
 
+    @classmethod
+    def paths_from_existing(cls, trend_root: str | Path) -> dict[str, str]:
+        """Resolve paths for an existing trend folder (Kho lưu trữ / re-run Module 3)."""
+        root = Path(trend_root).resolve()
+        videos_dir = root / "Videos"
+        images_dir = root / "Images"
+        if not root.is_dir():
+            raise StorageManagerError(f"Trend folder not found: {root}")
+        if not videos_dir.is_dir() or not images_dir.is_dir():
+            raise StorageManagerError(
+                f"Incomplete trend folder (missing Videos/ or Images/): {root}"
+            )
+        videos_dir.mkdir(parents=True, exist_ok=True)
+        images_dir.mkdir(parents=True, exist_ok=True)
+        (root / "Content").mkdir(parents=True, exist_ok=True)
+        return {
+            "trend_root": str(root),
+            "videos_dir": str(videos_dir.resolve()),
+            "images_dir": str(images_dir.resolve()),
+        }
+
     @property
     def trend_info_path(self) -> Path:
         return self.trend_root / "trend_info.txt"

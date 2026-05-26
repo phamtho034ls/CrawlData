@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import threading
 import time
 from pathlib import Path
@@ -16,8 +17,10 @@ configure_prefect()
 
 from main_pipeline import run_pipeline
 from src.device_utils import gpu_status_message
+from src.localization_pipeline import run_localization_pipeline
 from src.pipeline_logging import LOG_FILE, setup_logging
 from src.pipeline_progress import PipelineProgress
+from src.rewrite_service import load_localization_profiles
 from src.scraper_config import ScraperConfig
 from src.trend_ai_forecaster import (
     RAW_KEYWORD_TARGET,
@@ -94,6 +97,10 @@ if "discovery_leaderboard_videos" not in st.session_state:
     st.session_state.discovery_leaderboard_videos = []
 if "discovery_velocity_df" not in st.session_state:
     st.session_state.discovery_velocity_df = None
+if "last_localization_result" not in st.session_state:
+    st.session_state.last_localization_result = None
+if "last_localization_error" not in st.session_state:
+    st.session_state.last_localization_error = None
 
 
 def _read_logs(tail_lines: int = 120) -> str:
@@ -290,6 +297,12 @@ def _run_pipeline_worker(job: dict[str, Any]) -> None:
             kwargs["pre_scraped_videos"] = job["pre_scraped_videos"]
         if job.get("pre_expanded_keywords"):
             kwargs["pre_expanded_keywords"] = job["pre_expanded_keywords"]
+        if job.get("existing_trend_root"):
+            kwargs["existing_trend_root"] = job["existing_trend_root"]
+        if job.get("module3_only"):
+            kwargs["module3_only"] = True
+        if job.get("max_videos") is not None:
+            kwargs["max_videos"] = job["max_videos"]
         result = run_pipeline(**kwargs)
         job["result"] = result
         job["error"] = None
@@ -335,6 +348,60 @@ def _start_forecaster_pipeline(
         args=(st.session_state.pipeline_job,),
         daemon=True,
     ).start()
+
+
+def _start_storage_module3_pipeline(
+    *,
+    trend: dict[str, Any],
+    max_videos: int,
+) -> None:
+    """Re-run Module 3 from Kho lưu trữ using saved video links."""
+    keyword = (trend.get("topic") or trend.get("keyword") or trend.get("label") or "trend").strip()
+    st.session_state.last_error = None
+    st.session_state.pipeline_job = {
+        "running": True,
+        "handled": False,
+        "started_at": time.time(),
+        "keyword": keyword,
+        "mode": "full",
+        "scraper_config": ScraperConfig.from_env(),
+        "existing_trend_root": trend["trend_root"],
+        "module3_only": True,
+        "max_videos": max_videos,
+        "progress_data": {
+            "fraction": 0.0,
+            "message": f"Module 3: phân tích {trend.get('video_count', 0)} video từ kho…",
+            "current_step": 0,
+            "total_steps": 1,
+        },
+        "log": [],
+        "result": None,
+        "error": None,
+    }
+    threading.Thread(
+        target=_run_pipeline_worker,
+        args=(st.session_state.pipeline_job,),
+        daemon=True,
+    ).start()
+
+
+def _run_storage_localization(
+    *,
+    trend: dict[str, Any],
+    langs: list[str],
+    profile_name: str,
+    max_videos: int,
+    render: bool,
+) -> dict[str, Any]:
+    """Run localization pipeline for one stored trend folder."""
+    keyword = (trend.get("topic") or trend.get("keyword") or trend.get("label") or "trend").strip()
+    return run_localization_pipeline(
+        trend_root=trend["trend_root"],
+        target_langs=langs,
+        profile_name=profile_name,
+        render=render,
+        max_videos=max_videos,
+    )
 
 
 def _start_discovery_pipeline(
@@ -522,6 +589,129 @@ def _render_trend_detail(trend: dict) -> None:
 
     with tab_videos:
         _render_video_cards(trend["videos"])
+
+        st.markdown("#### Phân tích video (Module 3)")
+        st.caption(
+            "Tải `.mp4`, transcript theo phút (`Content/`), clips (`Videos/clips/`), keyframes. "
+            "Cần **ffmpeg** và chế độ Whisper. YouTube: dùng `YTDLP_COOKIES_FILE` hoặc đóng Chrome."
+        )
+        max_videos_input = st.number_input(
+            "Số video tối đa (0 = tất cả link trong kho)",
+            min_value=0,
+            max_value=50,
+            value=0,
+            key=f"storage_max_videos_{trend['id']}",
+        )
+        pipeline_busy = bool(
+            st.session_state.pipeline_job and st.session_state.pipeline_job.get("running")
+        )
+        if st.button(
+            "▶ Tải & phân tích video từ kho",
+            type="primary",
+            disabled=pipeline_busy or trend["video_count"] == 0,
+            key=f"storage_run_m3_{trend['id']}",
+        ):
+            _start_storage_module3_pipeline(
+                trend=trend,
+                max_videos=int(max_videos_input),
+            )
+            st.session_state.page = "collect"
+            st.rerun()
+
+        st.markdown("#### Localization & Edit video")
+        st.caption(
+            "Dịch transcript theo phút → rewrite bằng model → tạo edit plan → render video final."
+        )
+        profiles = load_localization_profiles()
+        profile_names = sorted(profiles.keys())
+        loc_langs = st.text_input(
+            "Ngôn ngữ đích (comma-separated)",
+            value="vi",
+            key=f"storage_loc_langs_{trend['id']}",
+            help="Ví dụ: vi hoặc vi,th,id",
+        )
+        lc1, lc2, lc3 = st.columns(3)
+        with lc1:
+            loc_profile = st.selectbox(
+                "Profile",
+                profile_names,
+                index=profile_names.index("short_vi_60s") if "short_vi_60s" in profile_names else 0,
+                key=f"storage_loc_profile_{trend['id']}",
+            )
+        with lc2:
+            loc_max_videos = st.number_input(
+                "Số video localization (0=tất cả)",
+                min_value=0,
+                max_value=50,
+                value=1,
+                key=f"storage_loc_max_{trend['id']}",
+            )
+        with lc3:
+            loc_render = st.checkbox(
+                "Render video",
+                value=True,
+                key=f"storage_loc_render_{trend['id']}",
+            )
+
+        if st.button(
+            "🌐 Chạy Localization",
+            disabled=pipeline_busy or trend["video_count"] == 0,
+            key=f"storage_run_loc_{trend['id']}",
+        ):
+            langs = [x.strip() for x in loc_langs.split(",") if x.strip()]
+            if not langs:
+                st.warning("Nhập ít nhất 1 ngôn ngữ đích (ví dụ: vi).")
+            else:
+                st.session_state.last_localization_error = None
+                with st.spinner("Đang chạy localization..."):
+                    try:
+                        result = _run_storage_localization(
+                            trend=trend,
+                            langs=langs,
+                            profile_name=loc_profile,
+                            max_videos=int(loc_max_videos),
+                            render=bool(loc_render),
+                        )
+                        st.session_state.last_localization_result = result
+                        st.success(
+                            f"Localization xong: {result.get('jobs_ok', 0)}/{result.get('jobs_total', 0)} job."
+                        )
+                    except Exception as exc:
+                        st.session_state.last_localization_error = str(exc)
+                        st.error(str(exc))
+
+        if st.session_state.last_localization_error:
+            st.warning(st.session_state.last_localization_error)
+
+        summary_path = Path(trend["trend_root"]) / "localization_summary.json"
+        summary_payload = st.session_state.last_localization_result
+        if summary_payload and summary_payload.get("trend_root") != str(Path(trend["trend_root"]).resolve()):
+            summary_payload = None
+        if (not summary_payload) and summary_path.is_file():
+            try:
+                summary_payload = json.loads(summary_path.read_text(encoding="utf-8"))
+            except Exception:
+                summary_payload = None
+
+        if summary_payload:
+            rows = []
+            for idx, item in enumerate(summary_payload.get("results") or [], start=1):
+                rows.append(
+                    {
+                        "#": idx,
+                        "Video ID": item.get("video_id") or "",
+                        "Lang": item.get("language") or "",
+                        "Status": item.get("status") or "",
+                        "Output": item.get("output_video") or "—",
+                        "Plan": item.get("edit_plan_path") or "—",
+                    }
+                )
+            st.caption(
+                f"Localization summary · OK={summary_payload.get('jobs_ok', 0)} / "
+                f"Total={summary_payload.get('jobs_total', 0)}"
+            )
+            if rows:
+                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
     with tab_text:
         _render_item_cards(
@@ -884,13 +1074,14 @@ elif page == "collect":
             media = result.get("media_module") or {}
             if result.get("mode") == "full":
                 n_dl = int(media.get("videos_downloaded") or 0)
-                if n_dl:
+                n_ok = int(media.get("videos_analyzed") or 0)
+                if n_dl or n_ok:
                     n_json = len(media.get("minute_content_files") or [])
                     st.success(
-                        f"Module 3: đã tải **{n_dl}** video vào `Videos/`"
+                        f"Module 3: tải **{n_dl}** video, phân tích **{n_ok}** video"
                         + (
-                            f", **{n_json}** file JSON nội dung/phút trong `Content/`, "
-                            "clip theo phút trong `Videos/clips/`."
+                            f" · **{n_json}** JSON/phút trong `Content/`, "
+                            "clip trong `Videos/clips/`."
                             if n_json
                             else "."
                         )

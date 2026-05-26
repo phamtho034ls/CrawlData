@@ -14,13 +14,17 @@ from typing import Any, Literal
 from prefect import flow, get_run_logger, task
 
 from src.article_scraper import download_web_images, scrape_article_data
-from src.content_store import save_video_links
+from src.content_store import load_videos_for_trend, save_video_links
 from src.context_synthesizer import generate_trend_context
 from src.device_utils import gpu_status_message
 from src.trend_content import append_transcript_item, build_text_items, save_trend_content
 from src.audio_transcriber import extract_audio_from_video, transcribe_audio
 from src.image_extractor import extract_video_keyframes
-from src.video_downloader import download_trend_video
+from src.video_downloader import (
+    download_trend_video,
+    notify_between_downloads,
+    reset_download_session,
+)
 from src.video_minute_splitter import (
     process_video_minute_split,
     transcript_text_from_minute_payload,
@@ -136,9 +140,76 @@ def _platform_from_trend_item(item: dict[str, Any]) -> str:
     return "youtube"
 
 
+def _normalize_video_entries(items: list[Any]) -> list[dict[str, Any]]:
+    """Coerce mixed video inputs (dict/string) into pipeline video objects."""
+    normalized: list[dict[str, Any]] = []
+    for index, raw in enumerate(items, start=1):
+        if isinstance(raw, str):
+            url = raw.strip()
+            if not url:
+                continue
+            platform = "tiktok" if "tiktok.com" in url.lower() else "youtube"
+            normalized.append(
+                {
+                    "url": url,
+                    "title": f"Video {index}",
+                    "platform": platform,
+                }
+            )
+            continue
+
+        if not isinstance(raw, dict):
+            continue
+
+        url = str(
+            raw.get("url")
+            or raw.get("link")
+            or raw.get("href")
+            or raw.get("video_url")
+            or ""
+        ).strip()
+        if not url:
+            continue
+
+        item = dict(raw)
+        item["url"] = url
+        item["platform"] = (
+            str(item.get("platform")).strip().lower()
+            if item.get("platform")
+            else ("tiktok" if "tiktok.com" in url.lower() else "youtube")
+        )
+        if not item.get("title"):
+            item["title"] = f"Video {index}"
+        normalized.append(item)
+
+    return normalized
+
+
+def _effective_max_videos(
+    config: ScraperConfig,
+    videos: list[dict[str, Any]],
+    *,
+    explicit: int | None,
+    from_saved_list: bool,
+) -> int | None:
+    """
+    Return cap for Module 3. None = process all videos in the list.
+    Saved/prefetched lists default to all links; scrape-only runs default to 3 unless configured.
+    """
+    if explicit is not None:
+        return None if explicit <= 0 else explicit
+    if from_saved_list:
+        cap = config.max_videos
+        return None if cap <= 0 else min(cap, len(videos))
+    cap = config.max_videos
+    if cap > 0:
+        return cap
+    return 3
+
+
 @task(name="process_media_assets", log_prints=True)
 def process_media_assets(
-    trend_data_list: list[dict[str, Any]],
+    trend_data_list: list[dict[str, Any]] | list[str],
     folder_paths: dict[str, str],
     *,
     max_videos: int | None = 3,
@@ -153,8 +224,9 @@ def process_media_assets(
     trend_root = Path(folder_paths["trend_root"])
     transcript_path = trend_root / "transcript.txt"
 
+    normalized_videos = _normalize_video_entries(list(trend_data_list))
     ranked = sorted(
-        trend_data_list,
+        normalized_videos,
         key=lambda v: v.get("view_count") if isinstance(v.get("view_count"), int) else 0,
         reverse=True,
     )
@@ -176,7 +248,11 @@ def process_media_assets(
         "no",
     }
 
+    reset_download_session()
+
     for index, item in enumerate(ranked, start=1):
+        if index > 1:
+            notify_between_downloads()
         url = (item.get("url") or "").strip()
         title = item.get("title") or f"Video {index}"
         if not url:
@@ -331,7 +407,7 @@ def process_media_assets(
                 "content_json": content_json_path,
                 "clips_dir": clips_dir,
                 "minute_count": minute_count,
-                "status": "ok",
+                "status": final_status,
             }
         )
         if progress:
@@ -358,7 +434,7 @@ def process_media_assets(
                 "source_keyword": next(
                     (
                         v.get("source_keyword")
-                        for v in trend_data_list
+                        for v in normalized_videos
                         if v.get("url") == item.get("url")
                     ),
                     "",
@@ -379,18 +455,22 @@ def process_media_assets(
     elif not transcript_path.exists():
         transcript_path.write_text("", encoding="utf-8")
 
-    ok_count = sum(1 for p in processed if p.get("status") == "ok")
+    analyzed_count = sum(1 for p in processed if p.get("status") == "ok")
+    downloaded_count = sum(
+        1 for p in processed if p.get("video_path") and Path(p["video_path"]).is_file()
+    )
     log.info(
-        "Module 3 complete: %d/%d videos downloaded, %d keyframes → %s",
-        ok_count,
+        "Module 3 complete: %d analyzed, %d downloaded / %d attempted, %d keyframes → %s",
+        analyzed_count,
+        downloaded_count,
         len(ranked),
         len(all_keyframes),
         videos_dir,
     )
-    if ranked and ok_count == 0:
+    if ranked and downloaded_count == 0:
         log.error(
             "No videos downloaded. Check: mode=Full+Whisper, ffmpeg on PATH. "
-            "If YTDLP_COOKIES_FROM_BROWSER is set, close Chrome or leave it empty."
+            "Set YTDLP_COOKIES_FILE or close Chrome when using YTDLP_COOKIES_FROM_BROWSER."
         )
 
     return {
@@ -401,7 +481,8 @@ def process_media_assets(
         "minute_clips_dirs": minute_clips_dirs,
         "minute_split_enabled": minute_split_enabled,
         "videos_attempted": len(ranked),
-        "videos_downloaded": ok_count,
+        "videos_downloaded": downloaded_count,
+        "videos_analyzed": analyzed_count,
     }
 
 
@@ -412,84 +493,134 @@ def run_pipeline(
     scraper_config: ScraperConfig | None = None,
     progress: PipelineProgress | None = None,
     *,
-    pre_scraped_videos: list[dict[str, Any]] | None = None,
+    pre_scraped_videos: list[dict[str, Any] | str] | None = None,
     pre_expanded_keywords: list[str] | None = None,
+    existing_trend_root: str | Path | None = None,
+    module3_only: bool = False,
+    max_videos: int | None = None,
     **config_overrides: int,
 ) -> dict[str, Any]:
     """
     Orchestrated workflow.
 
     mode=links: storage + multi-keyword scrape + save links + enrich text.
-    mode=full: also download top video + Whisper transcript.
+    mode=full: download videos + Whisper/minute JSON + keyframes.
 
-    When pre_scraped_videos is set, skips scraping and uses that video list.
-    When only pre_expanded_keywords is set, scrapes with those keywords (AI Forecaster).
+    pre_scraped_videos: skip scrape, use this list (all items processed by default).
+    existing_trend_root: resume on a saved trend folder (loads video_links.json / .txt).
+    module3_only: only Module 3 on existing_trend_root (implies mode=full).
     """
-    config = scraper_config or ScraperConfig.from_env(**config_overrides)
+    if module3_only and not existing_trend_root:
+        raise ValueError("module3_only requires existing_trend_root")
 
-    use_prefetched_videos = pre_scraped_videos is not None
+    config = scraper_config or ScraperConfig.from_env(**config_overrides)
+    if module3_only:
+        mode = "full"
+
+    resuming = existing_trend_root is not None
+    use_prefetched_videos = pre_scraped_videos is not None or resuming
+    from_saved_list = (pre_scraped_videos is not None) or resuming
+
     forecaster_keywords = (
         list(pre_expanded_keywords)
         if pre_expanded_keywords and not use_prefetched_videos
         else None
     )
-    if use_prefetched_videos:
+    if module3_only:
+        scrape_steps = 0
+    elif use_prefetched_videos and not resuming:
         scrape_steps = 0
     elif forecaster_keywords:
         scrape_steps = len(forecaster_keywords)
     else:
         scrape_steps = config.keyword_count
-    total_steps = 3 + scrape_steps + (1 if mode == "full" else 0)
+
+    module2_steps = 0 if module3_only else 2
+    total_steps = module2_steps + scrape_steps + (1 if mode == "full" else 0)
     if progress:
         progress.start(total_steps, "Bắt đầu pipeline")
 
     logger.info("%s", gpu_status_message())
-    if progress:
-        progress.step("Thiết lập kho lưu trữ")
-    paths = setup_storage_task(keyword)
 
-    if use_prefetched_videos:
-        videos = list(pre_scraped_videos or [])
-        expanded_keywords = list(pre_expanded_keywords or [])
+    if resuming:
+        paths = StorageManager.paths_from_existing(existing_trend_root)
+        videos = _normalize_video_entries(load_videos_for_trend(paths["trend_root"]))
         if not videos:
-            raise ValueError("pre_scraped_videos is empty")
-        if progress and expanded_keywords:
-            progress.set_keywords(expanded_keywords)
-            for index, kw in enumerate(expanded_keywords, start=1):
-                count = sum(1 for v in videos if v.get("source_keyword") == kw)
-                progress.begin_keyword_search(kw, index, len(expanded_keywords), step=2 + index)
-                progress.complete_keyword_search(kw, count)
+            raise ValueError(
+                f"No video links in trend folder: {paths['trend_root']}"
+            )
+        expanded_keywords = list(pre_expanded_keywords or [])
+        if not expanded_keywords:
+            ek_path = Path(paths["trend_root"]) / "expanded_keywords.json"
+            if ek_path.is_file():
+                try:
+                    payload = json.loads(ek_path.read_text(encoding="utf-8"))
+                    expanded_keywords = list(payload.get("keywords") or [])
+                except json.JSONDecodeError:
+                    pass
+        if not expanded_keywords:
+            expanded_keywords = [keyword]
+        if progress:
+            progress.step(f"Kho lưu trữ: {len(videos)} video")
     else:
-        videos, expanded_keywords = collect_videos_for_topic(
-            keyword,
-            config,
-            progress,
-            keywords=forecaster_keywords,
+        if progress:
+            progress.step("Thiết lập kho lưu trữ")
+        paths = setup_storage_task(keyword)
+
+        if pre_scraped_videos is not None:
+            videos = _normalize_video_entries(list(pre_scraped_videos))
+            expanded_keywords = list(pre_expanded_keywords or [])
+            if not videos:
+                raise ValueError("pre_scraped_videos is empty")
+            if progress and expanded_keywords:
+                progress.set_keywords(expanded_keywords)
+                for index, kw in enumerate(expanded_keywords, start=1):
+                    count = sum(1 for v in videos if v.get("source_keyword") == kw)
+                    progress.begin_keyword_search(
+                        kw, index, len(expanded_keywords), step=2 + index
+                    )
+                    progress.complete_keyword_search(kw, count)
+        else:
+            videos, expanded_keywords = collect_videos_for_topic(
+                keyword,
+                config,
+                progress,
+                keywords=forecaster_keywords,
+            )
+
+    link_paths: dict[str, str] = {}
+    if not module3_only:
+        if progress:
+            progress.step("Lưu link & metadata video")
+        link_paths = save_video_links_task(videos, paths["trend_root"])
+
+        keywords_path = Path(paths["trend_root"]) / "expanded_keywords.json"
+        keywords_path.write_text(
+            json.dumps(
+                {"topic": keyword, "keywords": expanded_keywords},
+                indent=2,
+                ensure_ascii=False,
+            )
+            + "\n",
+            encoding="utf-8",
         )
 
-    if progress:
-        progress.step("Lưu link & metadata video")
-    link_paths = save_video_links_task(videos, paths["trend_root"])
-
-    keywords_path = Path(paths["trend_root"]) / "expanded_keywords.json"
-    keywords_path.write_text(
-        json.dumps(
-            {"topic": keyword, "keywords": expanded_keywords},
-            indent=2,
-            ensure_ascii=False,
+        context_keyword = (expanded_keywords[0] if expanded_keywords else keyword).strip()
+        if progress:
+            progress.step("Module 2: tìm bài viết & tổng hợp ngữ cảnh (LLM)")
+        context_result = process_trend_context(
+            context_keyword,
+            paths,
+            max_search_results=3,
         )
-        + "\n",
-        encoding="utf-8",
-    )
+    else:
+        context_result = {
+            "trend_info_path": str((Path(paths["trend_root"]) / "trend_info.txt").resolve()),
+            "image_paths": [],
+            "articles_scraped": 0,
+            "search_hits": 0,
+        }
 
-    context_keyword = (expanded_keywords[0] if expanded_keywords else keyword).strip()
-    if progress:
-        progress.step("Module 2: tìm bài viết & tổng hợp ngữ cảnh (LLM)")
-    context_result = process_trend_context(
-        context_keyword,
-        paths,
-        max_search_results=3,
-    )
     trend_info_path = context_result["trend_info_path"]
 
     primary = videos[0] if videos else {}
@@ -505,7 +636,10 @@ def run_pipeline(
             "videos_per_platform": config.videos_per_platform,
             "videos_per_keyword_search": config.videos_per_keyword_search,
             "top_videos_per_keyword": config.top_videos_per_keyword,
+            "max_videos": config.max_videos,
         },
+        "module3_only": module3_only,
+        "resumed_from": paths["trend_root"] if resuming else None,
         "expanded_keywords": expanded_keywords,
         "trend_root": paths["trend_root"],
         "videos_dir": paths["videos_dir"],
@@ -523,10 +657,16 @@ def run_pipeline(
     if mode == "full":
         if progress:
             progress.step("Module 3: tải video, transcript, keyframes")
+        max_cap = _effective_max_videos(
+            config,
+            videos,
+            explicit=max_videos,
+            from_saved_list=from_saved_list,
+        )
         media_result = process_media_assets(
             videos,
             paths,
-            max_videos=3,
+            max_videos=max_cap,
             progress=progress,
         )
         result["media_module"] = media_result
@@ -545,14 +685,14 @@ def run_pipeline(
                 source_url=ok_videos[0].get("url") or "",
                 source_title=ok_videos[0].get("title") or title,
             )
-        else:
+        elif not media_result.get("videos_downloaded"):
             logger.warning(
                 "Module 3: no videos were downloaded (%s attempted). See logs.",
                 media_result.get("videos_attempted", 0),
             )
             result["media_download_error"] = (
-                "Không tải được video. Chọn Full + Whisper, cài ffmpeg, "
-                "hoặc để trống YTDLP_COOKIES_FROM_BROWSER nếu Chrome đang mở."
+                "Không tải được video. Cài ffmpeg; dùng YTDLP_COOKIES_FILE "
+                "(Netscape cookies.txt) hoặc đóng Chrome khi dùng YTDLP_COOKIES_FROM_BROWSER."
             )
 
     summary_path = Path(paths["trend_root"]) / "pipeline_summary.json"
